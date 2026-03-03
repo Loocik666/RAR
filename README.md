@@ -1,11 +1,11 @@
-# RAR — Looped mini-GPT на PyTorch (русский язык + код)
+# Project Root — Looped Transformer на PyTorch (русский язык + код)
 
 Проект реализует компактную **decoder-only Transformer** модель с концепцией **Looped Language Model (Latent Reasoning)**:
 
-- shared-блоки трансформера прогоняются **итеративно** (`n_loops`),
-- на каждом цикле считается логит следующего токена,
-- `exit_gate` оценивает, «готова» ли модель завершить рассуждение,
-- на обучении используется **multi-exit loss** + регуляризация использования глубины.
+- используется **один shared `ReasoningBlock`** (рекурсивно `n_loops` раз),
+- обновление состояния: `h_{i+1} = LayerNorm(h_i + Block(h_i))`,
+- входные/выходные веса связаны (Weight Tying): `lm_head.weight = transformer.wte.weight`,
+- добавлен **Self-Consistency Exit Head**: оценивает, насколько стабилизировался вектор `h` между итерациями.
 
 Поддерживаются:
 - обучение с нуля,
@@ -19,10 +19,10 @@
 
 - `model.py`
   - `GPTConfig` (включая `n_loops`),
-  - `RMSNorm`,
-  - `CausalSelfAttention` через `scaled_dot_product_attention`,
-  - `Block`,
-  - looped `GPT` с `exit_gate`, per-loop логитами и генерацией с ранним выходом.
+  - `ReasoningBlock` (shared-recurrent ядро),
+  - рекурсивная формула обновления скрытого состояния,
+  - weight tying (`transformer.wte` <-> `lm_head`),
+  - `Self-Consistency Exit Head` и per-loop логиты.
 
 - `data_utils.py`
   - `BPETokenizer` (`tiktoken`),
@@ -75,7 +75,7 @@ python -c "import torch; print(torch.cuda.is_available())"
 python train.py --text_path data.txt --out_dir checkpoints
 ```
 
-### 2) Важные параметры
+### 2) Важные параметры (Project Root ядро)
 
 - Токенизация:
   - `--encoding_name cl100k_base` (рекомендуется),

@@ -1,4 +1,4 @@
-"""Looped decoder-only Transformer (GPT-подобная) с latent reasoning на PyTorch."""
+"""Looped Transformer ядро для Project Root: shared рекуррентный блок + weight tying."""
 
 from dataclasses import dataclass
 
@@ -15,13 +15,13 @@ class GPTConfig:
     block_size: int = 256
     n_embd: int = 384
     n_head: int = 6
-    n_layer: int = 2  # глубина shared-группы блоков в одном loop-шаге
-    n_loops: int = 4  # число рекурсивных прогонов shared-блоков
+    n_layer: int = 1  # legacy-параметр для совместимости чекпоинтов
+    n_loops: int = 4
     dropout: float = 0.1
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm для более стабильного обучения."""
+    """RMSNorm для устойчивого обучения."""
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -76,59 +76,53 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
-class MLP(nn.Module):
-    """Feed-forward блок."""
+class ReasoningBlock(nn.Module):
+    """Один shared-блок рассуждения, который используется рекурсивно."""
 
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
+        self.norm_attn = RMSNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.norm_mlp = RMSNorm(config.n_embd)
         self.fc1 = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.fc2 = nn.Linear(4 * config.n_embd, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc1(x)
-        x = F.gelu(x)
-        x = self.fc2(x)
-        return self.dropout(x)
-
-
-class Block(nn.Module):
-    """Pre-Norm блок: RMSNorm -> Attention -> RMSNorm -> MLP."""
-
-    def __init__(self, config: GPTConfig) -> None:
-        super().__init__()
-        self.norm1 = RMSNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
-        self.norm2 = RMSNorm(config.n_embd)
-        self.mlp = MLP(config)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
+        attn_out = self.attn(self.norm_attn(x))
+        mlp_out = self.fc2(F.gelu(self.fc1(self.norm_mlp(x))))
+        mlp_out = self.dropout(mlp_out)
+        return attn_out + mlp_out
 
 
 class GPT(nn.Module):
-    """Looped mini-GPT с shared-блоками и exit gate."""
+    """Looped mini-GPT с рекурсией, weight tying и self-consistency exit head."""
 
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         self.config = config
 
-        self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
-        self.drop = nn.Dropout(config.dropout)
+        # Именование в стиле transformer.wte / transformer.wpe для явного weight tying.
+        self.transformer = nn.ModuleDict(
+            {
+                "wte": nn.Embedding(config.vocab_size, config.n_embd),
+                "wpe": nn.Embedding(config.block_size, config.n_embd),
+                "drop": nn.Dropout(config.dropout),
+            }
+        )
 
-        # Shared-группа блоков, которая многократно применяется в loop-режиме.
-        self.loop_blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-
+        self.reasoning_block = ReasoningBlock(config)
+        self.loop_norm = RMSNorm(config.n_embd)
         self.norm_f = RMSNorm(config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # Шлюз выхода: оценивает готовность завершить рассуждение на текущем loop.
-        self.exit_gate = nn.Linear(config.n_embd, 1)
+        # Self-consistency head: оценивает стабильность h между итерациями.
+        # Вход: [mean_abs_delta, mean_sq_delta] -> вероятность выхода.
+        self.exit_head = nn.Linear(2, 1)
 
-        self.lm_head.weight = self.tok_emb.weight
+        # Weight Tying (критично по заданию).
+        self.lm_head.weight = self.transformer["wte"].weight
+
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -140,27 +134,32 @@ class GPT(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def _forward_loops(self, idx: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-        """Возвращает logits и gate_prob для каждого loop-шага."""
+        """Рекурсивный проход по n_loops с per-loop logits и exit probability."""
         bsz, seq_len = idx.size()
         if seq_len > self.config.block_size:
             raise ValueError("Длина последовательности превышает block_size.")
 
         positions = torch.arange(0, seq_len, device=idx.device).unsqueeze(0)
-        latent = self.drop(self.tok_emb(idx) + self.pos_emb(positions))
+        h = self.transformer["drop"](self.transformer["wte"](idx) + self.transformer["wpe"](positions))
 
         loop_logits: list[torch.Tensor] = []
         gate_probs: list[torch.Tensor] = []
 
         for _ in range(self.config.n_loops):
-            for block in self.loop_blocks:
-                latent = block(latent)
+            h_prev = h
 
-            hidden = self.norm_f(latent)
+            # Требуемая формула:
+            # h_{i+1} = LayerNorm(h_i + Block(h_i))
+            h = self.loop_norm(h + self.reasoning_block(h))
+
+            hidden = self.norm_f(h)
             logits = self.lm_head(hidden)
 
-            # Gate считаем по состоянию последнего токена в последовательности.
-            gate_logit = self.exit_gate(hidden[:, -1, :])
-            gate_prob = torch.sigmoid(gate_logit).squeeze(-1)
+            delta = h - h_prev
+            mean_abs_delta = delta.abs().mean(dim=(1, 2), keepdim=True)
+            mean_sq_delta = delta.pow(2).mean(dim=(1, 2), keepdim=True)
+            gate_in = torch.cat([mean_abs_delta, mean_sq_delta], dim=-1).squeeze(1)
+            gate_prob = torch.sigmoid(self.exit_head(gate_in)).squeeze(-1)
 
             loop_logits.append(logits)
             gate_probs.append(gate_prob)
@@ -172,7 +171,6 @@ class GPT(nn.Module):
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
-        """Возвращает результаты по всем loop-итерациям."""
         loop_logits, gate_probs = self._forward_loops(idx)
 
         out: dict[str, torch.Tensor | list[torch.Tensor]] = {
@@ -182,7 +180,6 @@ class GPT(nn.Module):
         }
 
         if targets is not None:
-            # Базовый per-loop CE без весов (финальная композиция в train.py).
             per_loop_ce = [
                 F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
                 for logits in loop_logits
@@ -201,7 +198,6 @@ class GPT(nn.Module):
         gate_threshold: float = 0.9,
         max_loops: int | None = None,
     ) -> torch.Tensor:
-        """Генерация с размышлением: ранний выход по gate или по max_loops."""
         loops_cap = self.config.n_loops if max_loops is None else max(1, min(max_loops, self.config.n_loops))
 
         for _ in range(max_new_tokens):
