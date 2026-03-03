@@ -47,45 +47,43 @@ def get_lr(step: int, warmup_iters: int, lr_decay_iters: int, min_lr: float, max
     return min_lr + coeff * (max_lr - min_lr)
 
 
-def get_loop_weights(n_loops: int, scheme: str, device: torch.device) -> torch.Tensor:
-    """Весы для multi-exit CE лосса."""
-    if scheme == "uniform":
-        w = torch.ones(n_loops, device=device)
-    elif scheme == "linear":
-        w = torch.arange(1, n_loops + 1, device=device, dtype=torch.float)
-    else:
-        raise ValueError("loop_loss_scheme должен быть 'uniform' или 'linear'.")
-    return w / w.sum()
-
-
 def compute_losses(
     model: GPT,
     xb: torch.Tensor,
     yb: torch.Tensor,
-    loop_weights: torch.Tensor,
     entropy_reg_weight: float,
+    early_exit_penalty_weight: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Считает multi-exit loss + entropy regularization для exit gate."""
+    """Считает лосс обучения с акцентом на рассуждение по всем loop-этапам."""
     outputs = model(xb, yb)
     per_loop_ce = outputs["per_loop_ce"]
     gate_probs = outputs["gate_probs"]
 
-    # Взвешенная сумма CE по loop-итерациям.
-    ce_loss = (per_loop_ce * loop_weights).sum()
+    # 1) Основной objective из замечания: учим быть правой на каждом loop-этапе.
+    ce_loss = per_loop_ce.mean()
 
-    # KL(P||U), где P — распределение использования loop-шагов.
     gate_stack = torch.stack(gate_probs, dim=0)  # [L, B]
+
+    # 2) KL(P||U), где P — распределение использования loop-шагов.
     usage_dist = torch.softmax(gate_stack.mean(dim=1), dim=0)
     n_loops = usage_dist.numel()
     uniform = torch.full_like(usage_dist, 1.0 / n_loops)
     kl_to_uniform = torch.sum(usage_dist * (torch.log(usage_dist + 1e-8) - torch.log(uniform + 1e-8)))
 
-    total_loss = ce_loss + entropy_reg_weight * kl_to_uniform
+    # 3) Штраф за «ленивый» ранний выход при высокой ошибке.
+    # Чем раньше цикл, тем выше его коэффициент (1.0 -> 0.0).
+    early_factor = torch.linspace(1.0, 0.0, steps=n_loops, device=xb.device)
+    gate_mean_by_loop = gate_stack.mean(dim=1)
+    ce_norm = per_loop_ce.detach() / (per_loop_ce.detach().mean() + 1e-8)
+    early_exit_penalty = (gate_mean_by_loop * early_factor * ce_norm).mean()
+
+    total_loss = ce_loss + entropy_reg_weight * kl_to_uniform + early_exit_penalty_weight * early_exit_penalty
 
     logs = {
         "loss": total_loss.item(),
         "ce_loss": ce_loss.item(),
         "kl_gate": kl_to_uniform.item(),
+        "early_exit_penalty": early_exit_penalty.item(),
         "gate_mean": gate_stack.mean().item(),
     }
     return total_loss, logs
@@ -100,8 +98,8 @@ def estimate_loss(
     batch_size: int,
     block_size: int,
     device: torch.device,
-    loop_weights: torch.Tensor,
     entropy_reg_weight: float,
+    early_exit_penalty_weight: float,
 ) -> dict[str, float]:
     """Оценка composite loss на train/val без градиентов."""
     out = {}
@@ -111,17 +109,20 @@ def estimate_loss(
         losses = torch.zeros(eval_iters)
         ce_losses = torch.zeros(eval_iters)
         kl_losses = torch.zeros(eval_iters)
+        early_penalties = torch.zeros(eval_iters)
 
         for k in range(eval_iters):
             xb, yb = get_batch(split_data, batch_size, block_size, device)
-            loss, logs = compute_losses(model, xb, yb, loop_weights, entropy_reg_weight)
+            loss, logs = compute_losses(model, xb, yb, entropy_reg_weight, early_exit_penalty_weight)
             losses[k] = loss.item()
             ce_losses[k] = logs["ce_loss"]
             kl_losses[k] = logs["kl_gate"]
+            early_penalties[k] = logs["early_exit_penalty"]
 
         out[f"{split_name}_loss"] = losses.mean().item()
         out[f"{split_name}_ce"] = ce_losses.mean().item()
         out[f"{split_name}_kl"] = kl_losses.mean().item()
+        out[f"{split_name}_early"] = early_penalties.mean().item()
 
     model.train()
     return out
@@ -157,7 +158,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--entropy_reg_weight", type=float, default=0.01)
-    parser.add_argument("--loop_loss_scheme", type=str, default="linear", choices=["uniform", "linear"])
+    parser.add_argument("--early_exit_penalty_weight", type=float, default=0.05)
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
@@ -217,11 +218,9 @@ def main() -> None:
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-    loop_weights = get_loop_weights(config.n_loops, args.loop_loss_scheme, device)
-
     print(f"Устройство: {device}")
     print(f"Размер словаря: {data.tokenizer.vocab_size}")
-    print(f"Loops: {config.n_loops}, loop_loss_scheme={args.loop_loss_scheme}")
+    print(f"Loops: {config.n_loops}")
 
     for step in range(resume_step, args.max_iters + 1):
         lr = get_lr(step, args.warmup_iters, args.lr_decay_iters, args.min_lr, args.learning_rate)
@@ -237,13 +236,13 @@ def main() -> None:
                 args.batch_size,
                 config.block_size,
                 device,
-                loop_weights,
                 args.entropy_reg_weight,
+                args.early_exit_penalty_weight,
             )
             print(
                 f"step {step:5d} | lr={lr:.6e} | "
-                f"train_loss={metrics['train_loss']:.4f} (ce={metrics['train_ce']:.4f}, kl={metrics['train_kl']:.4f}) | "
-                f"val_loss={metrics['val_loss']:.4f} (ce={metrics['val_ce']:.4f}, kl={metrics['val_kl']:.4f})"
+                f"train_loss={metrics['train_loss']:.4f} (ce={metrics['train_ce']:.4f}, kl={metrics['train_kl']:.4f}, early={metrics['train_early']:.4f}) | "
+                f"val_loss={metrics['val_loss']:.4f} (ce={metrics['val_ce']:.4f}, kl={metrics['val_kl']:.4f}, early={metrics['val_early']:.4f})"
             )
 
             ckpt = {
@@ -257,7 +256,13 @@ def main() -> None:
             torch.save(ckpt, latest_ckpt_path)
 
         xb, yb = get_batch(data.train_ids, args.batch_size, config.block_size, device)
-        loss, train_logs = compute_losses(model, xb, yb, loop_weights, args.entropy_reg_weight)
+        loss, train_logs = compute_losses(
+            model,
+            xb,
+            yb,
+            args.entropy_reg_weight,
+            args.early_exit_penalty_weight,
+        )
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -267,7 +272,8 @@ def main() -> None:
         if step % args.eval_interval == 0:
             print(
                 f"train_step_metrics | loss={train_logs['loss']:.4f} | ce={train_logs['ce_loss']:.4f} | "
-                f"kl={train_logs['kl_gate']:.4f} | gate_mean={train_logs['gate_mean']:.4f}"
+                f"kl={train_logs['kl_gate']:.4f} | early={train_logs['early_exit_penalty']:.4f} | "
+                f"gate_mean={train_logs['gate_mean']:.4f}"
             )
 
     print(f"Обучение завершено. Чекпоинт: {latest_ckpt_path}")

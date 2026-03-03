@@ -85,8 +85,9 @@ python train.py --text_path data.txt --out_dir checkpoints
   - `--n_layer` — глубина **shared-группы** блоков,
   - `--n_loops` — число loop-итераций рассуждения.
 - Лосс/регуляризация:
-  - `--loop_loss_scheme {uniform,linear}`,
-  - `--entropy_reg_weight`.
+  - базовый лосс: `per_loop_ce.mean()` (модель учится быть корректной на каждом цикле),
+  - `--entropy_reg_weight`,
+  - `--early_exit_penalty_weight` (штраф за ранний выход при высокой ошибке).
 - Обучение:
   - `--learning_rate`, `--min_lr`, `--warmup_iters`, `--lr_decay_iters`,
   - `--weight_decay`, `--grad_clip`,
@@ -110,8 +111,8 @@ python train.py \
   --min_lr 3e-5 \
   --warmup_iters 200 \
   --lr_decay_iters 5000 \
-  --loop_loss_scheme linear \
-  --entropy_reg_weight 0.01
+  --entropy_reg_weight 0.01 \
+  --early_exit_penalty_weight 0.05
 ```
 
 ### 4) Resume training (автоматически)
