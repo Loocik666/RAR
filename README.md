@@ -28,6 +28,11 @@
   - `BPETokenizer` (`tiktoken`),
   - `build_dataset`, `get_batch`.
 
+- `data_preprocessor.py`
+  - рекурсивный сбор датасета через `os.walk`,
+  - фильтрация по расширениям (`.py/.txt/.xml/.json/.md/.yaml/.sql/.c/.cpp`),
+  - очистка контента и сбор статистики по расширениям.
+
 - `train.py`
   - AdamW с выборочным weight decay,
   - warmup + cosine LR,
@@ -68,6 +73,24 @@ python -c "import torch; print(torch.cuda.is_available())"
 ---
 
 ## Обучение (пошагово)
+
+### 0) Подготовка `data.txt` из папки с исходниками/текстами
+
+```bash
+python data_preprocessor.py --root_dir ./your_corpus --output data.txt
+```
+
+Что делает скрипт:
+- рекурсивно обходит папки,
+- берет только расширения: `.py .txt .xml .json .md .yaml .sql .c .cpp`,
+- отбрасывает файлы короче `100` символов,
+- отбрасывает строки длиннее `500` символов,
+- ограничивает общий размер датасета (`--max_total_mb`, по умолчанию `200`),
+- пишет блоки в формате:
+  - `[FILE: name.ext]`
+  - `[CONTENT]`
+  - `<|endoftext|>`,
+- в конце печатает статистику по расширениям (files/bytes).
 
 ### 1) Базовый запуск
 
