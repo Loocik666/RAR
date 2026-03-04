@@ -1,12 +1,27 @@
-"""Утилиты для токенизации и подготовки батчей (BPE через tiktoken)."""
+"""Утилиты токенизации и загрузки данных из txt/xml/json/md/yaml/кода."""
 
 from __future__ import annotations
 
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+
+
+SUPPORTED_EXTENSIONS = {
+    ".py",
+    ".txt",
+    ".xml",
+    ".json",
+    ".md",
+    ".yaml",
+    ".yml",
+    ".sql",
+    ".c",
+    ".cpp",
+}
 
 
 class BPETokenizer:
@@ -16,9 +31,7 @@ class BPETokenizer:
         try:
             import tiktoken
         except ImportError as exc:
-            raise ImportError(
-                "Установите tiktoken: pip install tiktoken"
-            ) from exc
+            raise ImportError("Установите tiktoken: pip install tiktoken") from exc
 
         if encoding_name not in {"gpt2", "cl100k_base"}:
             raise ValueError("Допустимые encoding_name: 'gpt2' или 'cl100k_base'.")
@@ -44,18 +57,76 @@ class DatasetBundle:
     tokenizer: BPETokenizer
 
 
-def load_text(path: str | Path) -> str:
-    """Чтение текстового корпуса из файла UTF-8."""
-    return Path(path).read_text(encoding="utf-8")
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return None
+
+
+def _is_preformatted(text: str) -> bool:
+    return "[FILE:" in text and "[CONTENT]" in text and "<|endoftext|>" in text
+
+
+def _format_block(path: Path, text: str) -> str:
+    return f"\n[FILE: {path.name}]\n[CONTENT]\n{text}\n<|endoftext|>\n"
+
+
+def collect_corpus(data_path: str, recursive: bool = True) -> str:
+    """Собирает корпус из файла/папки в единый текст.
+
+    - Если передан файл: читается как есть (с разметкой или без).
+    - Если папка: собираются только SUPPORTED_EXTENSIONS, каждый файл оборачивается
+      в мета-блок [FILE]/[CONTENT]/<|endoftext|>, если у него нет готовой разметки.
+    """
+    path = Path(data_path)
+    if not path.exists():
+        raise ValueError(f"Путь не существует: {path}")
+
+    if path.is_file():
+        text = _read_text(path)
+        if text is None:
+            raise ValueError(f"Не удалось прочитать файл как UTF-8: {path}")
+        return text
+
+    parts: list[str] = []
+
+    if recursive:
+        walker = os.walk(path)
+        candidates = [Path(root) / name for root, _, files in walker for name in files]
+    else:
+        candidates = [p for p in path.iterdir() if p.is_file()]
+
+    candidates.sort()
+
+    for file_path in candidates:
+        ext = file_path.suffix.lower()
+        if ext not in SUPPORTED_EXTENSIONS:
+            continue
+
+        text = _read_text(file_path)
+        if text is None:
+            continue
+
+        if _is_preformatted(text):
+            parts.append(text.strip() + "\n")
+        else:
+            parts.append(_format_block(file_path, text.strip()))
+
+    merged = "\n".join(parts).strip()
+    if not merged:
+        raise ValueError("После фильтрации не найдено пригодных текстовых данных.")
+    return merged
 
 
 def build_dataset(
-    text_path: str,
+    data_path: str,
     val_ratio: float = 0.1,
     encoding_name: str = "cl100k_base",
+    recursive: bool = True,
 ) -> DatasetBundle:
-    """Загрузка текста, BPE-токенизация, разбиение на train/val."""
-    text = load_text(text_path)
+    """Загрузка корпуса из файла/папки, BPE-токенизация, разбиение на train/val."""
+    text = collect_corpus(data_path, recursive=recursive)
     tokenizer = BPETokenizer(encoding_name=encoding_name)
 
     ids = torch.tensor(tokenizer.encode(text), dtype=torch.long)

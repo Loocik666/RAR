@@ -28,10 +28,6 @@
   - `BPETokenizer` (`tiktoken`),
   - `build_dataset`, `get_batch`.
 
-- `data_preprocessor.py`
-  - рекурсивный сбор датасета через `os.walk`,
-  - фильтрация по расширениям (`.py/.txt/.xml/.json/.md/.yaml/.sql/.c/.cpp`),
-  - очистка контента и сбор статистики по расширениям.
 
 - `train.py`
   - AdamW с выборочным weight decay,
@@ -63,7 +59,15 @@ python -c "import torch; print(torch.cuda.is_available())"
 
 ## Подготовка данных
 
-1. Создайте текстовый файл `data.txt` в UTF-8.
+Проект теперь умеет обучаться **на файле или директории** без отдельного preprocessor-скрипта.
+
+Поддерживаемые расширения при чтении папки:
+- `.py`, `.txt`, `.xml`, `.json`, `.md`, `.yaml`, `.yml`, `.sql`, `.c`, `.cpp`
+
+Если файл уже содержит готовую разметку вида `[FILE] / [CONTENT] / <|endoftext|>`,
+она будет использована как есть. Если разметки нет — файлы автоматически оборачиваются в этот формат.
+
+1. Укажите `--data_path` как путь к одному файлу или папке с корпусом.
 2. Для русского + кода лучше смешанный корпус:
    - статьи/документация,
    - диалоги,
@@ -74,28 +78,10 @@ python -c "import torch; print(torch.cuda.is_available())"
 
 ## Обучение (пошагово)
 
-### 0) Подготовка `data.txt` из папки с исходниками/текстами
-
-```bash
-python data_preprocessor.py --root_dir ./your_corpus --output data.txt
-```
-
-Что делает скрипт:
-- рекурсивно обходит папки,
-- берет только расширения: `.py .txt .xml .json .md .yaml .sql .c .cpp`,
-- отбрасывает файлы короче `100` символов,
-- отбрасывает строки длиннее `500` символов,
-- ограничивает общий размер датасета (`--max_total_mb`, по умолчанию `200`),
-- пишет блоки в формате:
-  - `[FILE: name.ext]`
-  - `[CONTENT]`
-  - `<|endoftext|>`,
-- в конце печатает статистику по расширениям (files/bytes).
-
 ### 1) Базовый запуск
 
 ```bash
-python train.py --text_path data.txt --out_dir checkpoints
+python train.py --data_path ./your_corpus_or_file --out_dir checkpoints
 ```
 
 ### 2) Важные параметры (Project Root ядро)
@@ -120,7 +106,7 @@ python train.py --text_path data.txt --out_dir checkpoints
 
 ```bash
 python train.py \
-  --text_path data.txt \
+  --data_path ./your_corpus_or_file \
   --out_dir checkpoints \
   --encoding_name cl100k_base \
   --block_size 256 \

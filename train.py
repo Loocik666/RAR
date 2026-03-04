@@ -131,7 +131,8 @@ def estimate_loss(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Обучение Looped GPT-подобной модели")
 
-    parser.add_argument("--text_path", type=str, required=True, help="Путь к .txt данным")
+    parser.add_argument("--data_path", type=str, default=None, help="Путь к файлу или директории с данными")
+    parser.add_argument("--text_path", type=str, default=None, help="Устаревший алиас для --data_path")
     parser.add_argument("--out_dir", type=str, default="checkpoints", help="Папка для чекпоинтов")
 
     # Данные
@@ -176,7 +177,11 @@ def main() -> None:
             raise RuntimeError("CUDA запрошена, но недоступна.")
         device = torch.device(args.device)
 
-    data = build_dataset(args.text_path, val_ratio=args.val_ratio, encoding_name=args.encoding_name)
+    data_source = args.data_path if args.data_path is not None else args.text_path
+    if data_source is None:
+        raise ValueError("Нужно указать --data_path (или legacy --text_path).")
+
+    data = build_dataset(data_source, val_ratio=args.val_ratio, encoding_name=args.encoding_name, recursive=True)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
