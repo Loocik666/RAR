@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--gate_threshold", type=float, default=0.9)
     parser.add_argument("--max_loops", type=int, default=None)
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--device", type=str, default="cuda", choices=["auto", "cpu", "cuda"])
     return parser.parse_args()
 
 
@@ -27,10 +27,14 @@ def main() -> None:
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif args.device == "cuda":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            print("CUDA недоступна, автоматически переключаюсь на CPU.")
+            device = torch.device("cpu")
     else:
-        if args.device == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA запрошена, но недоступна.")
-        device = torch.device(args.device)
+        device = torch.device("cpu")
 
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
 

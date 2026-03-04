@@ -27,14 +27,30 @@ pip install torch tiktoken
 
 ### 3) Запустите обучение
 
+> По умолчанию скрипт запускается с `--device cuda` (GPU-first). Если CUDA недоступна, он автоматически переключится на CPU.
+
 ```bash
 python train.py --data_path ./corpus --out_dir checkpoints
 ```
 
+Принудительно указать GPU:
+
+```bash
+python train.py --data_path ./corpus --out_dir checkpoints --device cuda
+```
+
 ### 4) Сгенерируйте текст
+
+> Для инференса по умолчанию также используется `--device cuda` (GPU-first), с автопереходом на CPU при отсутствии CUDA.
 
 ```bash
 python chat.py --checkpoint checkpoints/latest.pt --prompt "Привет!" --max_new_tokens 150
+```
+
+Принудительно указать GPU:
+
+```bash
+python chat.py --checkpoint checkpoints/latest.pt --prompt "Привет!" --max_new_tokens 150 --device cuda
 ```
 
 ---
@@ -117,6 +133,9 @@ python train.py --data_path ./corpus --out_dir checkpoints
 - `--text_path` — legacy-алиас (оставлен для совместимости)
 - `--val_ratio` — доля валидации (по умолчанию `0.1`)
 - `--encoding_name` — `cl100k_base` (рекомендуется) или `gpt2`
+- `--device` — `cuda` (по умолчанию), `auto` или `cpu`
+  - `cuda`: GPU-first режим с fallback на CPU, если CUDA нет
+  - `auto`: выбрать CUDA при наличии, иначе CPU
 
 ### Архитектура
 - `--block_size` — длина контекста
@@ -176,6 +195,8 @@ python chat.py \
   --prompt "Объясни, что такое рекурсия" \
   --max_new_tokens 200
 ```
+
+По умолчанию используется `--device cuda` (GPU-first) с fallback на CPU.
 
 ## 2) Управление качеством генерации
 
