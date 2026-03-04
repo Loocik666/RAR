@@ -1,112 +1,142 @@
-# Project Root — Looped Transformer на PyTorch (русский язык + код)
+# Project Root — Looped Transformer (PyTorch) для русского языка и кода
 
-Проект реализует компактную **decoder-only Transformer** модель с концепцией **Looped Language Model (Latent Reasoning)**:
+Этот репозиторий нужен, чтобы **быстро запустить обучение своей компактной LLM** (decoder-only, GPT-подобной),
+которая умеет работать с русским текстом и кодом.
 
-- используется **один shared `ReasoningBlock`** (рекурсивно `n_loops` раз),
-- обновление состояния: `h_{i+1} = LayerNorm(h_i + Block(h_i))`,
-- входные/выходные веса связаны (Weight Tying): `lm_head.weight = transformer.wte.weight`,
-- добавлен **Self-Consistency Exit Head**: оценивает, насколько стабилизировался вектор `h` между итерациями.
-
-Поддерживаются:
-- обучение с нуля,
-- автопродолжение обучения из `latest.pt` (resume),
-- инференс на CPU/GPU,
-- BPE токенизация через `tiktoken` (`cl100k_base` / `gpt2`).
+Главная особенность проекта — **Looped Reasoning**:
+- один и тот же `ReasoningBlock` используется повторно `n_loops` раз,
+- модель может «подумать» несколько циклов перед предсказанием,
+- есть `Exit Head`, который оценивает, достаточно ли текущего уровня «стабильности» скрытого состояния.
 
 ---
 
-## Что внутри
+## Быстрый старт (если хотите запустить за 5 минут)
 
-- `model.py`
-  - `GPTConfig` (включая `n_loops`),
-  - `ReasoningBlock` (shared-recurrent ядро),
-  - рекурсивная формула обновления скрытого состояния,
-  - weight tying (`transformer.wte` <-> `lm_head`),
-  - `Self-Consistency Exit Head` и per-loop логиты.
-
-- `data_utils.py`
-  - `BPETokenizer` (`tiktoken`),
-  - `build_dataset`, `get_batch`.
-
-
-- `train.py`
-  - AdamW с выборочным weight decay,
-  - warmup + cosine LR,
-  - **multi-exit CE loss**,
-  - **KL-регуляризация** распределения глубины,
-  - checkpoint/resume из `out_dir/latest.pt`.
-
-- `chat.py`
-  - генерация с параметрами `gate_threshold` и `max_loops`.
-
----
-
-## Установка
-
-Требуется Python 3.10+.
+### 1) Установите зависимости
 
 ```bash
 pip install torch tiktoken
 ```
 
-Проверка CUDA:
+### 2) Подготовьте данные
 
-```bash
-python -c "import torch; print(torch.cuda.is_available())"
-```
+Положите ваши файлы в папку, например `./corpus`.
 
----
-
-## Подготовка данных
-
-Проект теперь умеет обучаться **на файле или директории** без отдельного preprocessor-скрипта.
-
-Поддерживаемые расширения при чтении папки:
+Поддерживаются расширения:
 - `.py`, `.txt`, `.xml`, `.json`, `.md`, `.yaml`, `.yml`, `.sql`, `.c`, `.cpp`
 
-Если файл уже содержит готовую разметку вида `[FILE] / [CONTENT] / <|endoftext|>`,
-она будет использована как есть. Если разметки нет — файлы автоматически оборачиваются в этот формат.
+### 3) Запустите обучение
 
-1. Укажите `--data_path` как путь к одному файлу или папке с корпусом.
-2. Для русского + кода лучше смешанный корпус:
-   - статьи/документация,
-   - диалоги,
-   - исходники,
-   - комментарии и README.
+```bash
+python train.py --data_path ./corpus --out_dir checkpoints
+```
+
+### 4) Сгенерируйте текст
+
+```bash
+python chat.py --checkpoint checkpoints/latest.pt --prompt "Привет!" --max_new_tokens 150
+```
 
 ---
 
-## Обучение (пошагово)
+## Что есть в проекте
 
-### 1) Базовый запуск
+- `model.py`
+  - Looped Transformer архитектура,
+  - `ReasoningBlock`,
+  - рекуррентное обновление состояния,
+  - weight tying (`lm_head.weight = transformer.wte.weight`),
+  - `Exit Head` и multi-loop forward.
 
-```bash
-python train.py --data_path ./your_corpus_or_file --out_dir checkpoints
+- `data_utils.py`
+  - `BPETokenizer` на `tiktoken`,
+  - сбор корпуса из файла/директории,
+  - поддержка **готовой разметки** и **сырых файлов**,
+  - формирование train/val и батчей.
+
+- `train.py`
+  - обучение,
+  - resume из `checkpoints/latest.pt`,
+  - warmup + cosine LR,
+  - multi-exit loss (`per_loop_ce.mean()`),
+  - KL-регуляризация распределения циклов,
+  - штраф за слишком ранний выход (`early_exit_penalty`).
+
+- `chat.py`
+  - инференс из чекпоинта,
+  - параметры `temperature`, `top_k`, `gate_threshold`, `max_loops`.
+
+---
+
+## Подготовка данных (подробно)
+
+Проект умеет обучаться:
+1. На **одном файле** (`--data_path ./data.txt`)
+2. На **папке** (`--data_path ./corpus`) — рекурсивно пройдёт по вложенным папкам.
+
+### Вариант A: данные уже размечены
+
+Если файл уже содержит блоки вида:
+
+```text
+[FILE: example.py]
+[CONTENT]
+print("hello")
+<|endoftext|>
 ```
 
-### 2) Важные параметры (Project Root ядро)
+то этот формат будет использован как есть.
 
-- Токенизация:
-  - `--encoding_name cl100k_base` (рекомендуется),
-  - `--encoding_name gpt2`.
-- Архитектура:
-  - `--block_size`, `--n_embd`, `--n_head`,
-  - `--n_layer` — глубина **shared-группы** блоков,
-  - `--n_loops` — число loop-итераций рассуждения.
-- Лосс/регуляризация:
-  - базовый лосс: `per_loop_ce.mean()` (модель учится быть корректной на каждом цикле),
-  - `--entropy_reg_weight`,
-  - `--early_exit_penalty_weight` (штраф за ранний выход при высокой ошибке).
-- Обучение:
-  - `--learning_rate`, `--min_lr`, `--warmup_iters`, `--lr_decay_iters`,
-  - `--weight_decay`, `--grad_clip`,
-  - `--max_iters`, `--eval_interval`, `--eval_iters`.
+### Вариант B: данные без разметки
 
-### 3) Пример запуска под looped reasoning
+Если файлы обычные (`.py`, `.md`, `.xml` и т.д.), система автоматически обернёт каждый файл в:
+
+```text
+[FILE: name.ext]
+[CONTENT]
+...
+<|endoftext|>
+```
+
+Это полезно, потому что модель начинает различать тип контента (код, markdown, json...).
+
+---
+
+## Обучение (подробно)
+
+## 1) Базовый запуск
+
+```bash
+python train.py --data_path ./corpus --out_dir checkpoints
+```
+
+## 2) Важные аргументы
+
+### Данные
+- `--data_path` — путь к файлу или папке с данными (**основной параметр**)
+- `--text_path` — legacy-алиас (оставлен для совместимости)
+- `--val_ratio` — доля валидации (по умолчанию `0.1`)
+- `--encoding_name` — `cl100k_base` (рекомендуется) или `gpt2`
+
+### Архитектура
+- `--block_size` — длина контекста
+- `--n_embd` — размер эмбеддинга
+- `--n_head` — число attention-голов
+- `--n_layer` — глубина shared-группы в loop-блоке
+- `--n_loops` — число reasoning-циклов
+
+### Обучение и регуляризация
+- `--learning_rate`, `--min_lr`
+- `--warmup_iters`, `--lr_decay_iters`
+- `--weight_decay`, `--grad_clip`
+- `--entropy_reg_weight` — KL-регуляризация распределения циклов
+- `--early_exit_penalty_weight` — штраф за ранний выход при большой ошибке
+
+## 3) Практический пример команды
 
 ```bash
 python train.py \
-  --data_path ./your_corpus_or_file \
+  --data_path ./corpus \
   --out_dir checkpoints \
   --encoding_name cl100k_base \
   --block_size 256 \
@@ -124,42 +154,42 @@ python train.py \
   --early_exit_penalty_weight 0.05
 ```
 
-### 4) Resume training (автоматически)
+## 4) Resume training (автоматически)
 
-Если `checkpoints/latest.pt` существует, скрипт:
-- загрузит веса модели,
-- загрузит состояние оптимизатора,
-- продолжит обучение с сохранённого `step`,
-- возьмёт архитектурные параметры из checkpoint-конфига.
+Если есть `checkpoints/latest.pt`, обучение продолжится автоматически.
 
-В консоли вы увидите:
-- `Обнаружен чекпоинт, продолжаю обучение с шага X`,
-или
-- `Чекпоинт не найден, начинаю обучение с нуля`.
+В логах вы увидите:
+- `Обнаружен чекпоинт, продолжаю обучение с шага X`
+
+Если чекпоинта нет:
+- `Чекпоинт не найден, начинаю обучение с нуля`
 
 ---
 
 ## Инференс / чат
 
+## 1) Минимальный запуск
+
 ```bash
 python chat.py \
   --checkpoint checkpoints/latest.pt \
-  --prompt "Объясни, как работает quicksort" \
+  --prompt "Объясни, что такое рекурсия" \
   --max_new_tokens 200
 ```
 
-Параметры генерации:
-- `--temperature` — температура сэмплирования,
-- `--top_k` — top-k фильтрация,
-- `--gate_threshold` — порог выхода по `exit_gate` (например `0.9`),
-- `--max_loops` — ограничение числа reasoning-циклов на инференсе.
+## 2) Управление качеством генерации
 
-Пример с контролем рассуждения:
+- `--temperature` — чем выше, тем более «креативный» ответ
+- `--top_k` — ограничение по top-k токенам
+- `--gate_threshold` — порог раннего выхода по reasoning-гейту
+- `--max_loops` — ограничение числа циклов рассуждения
+
+Пример для кода:
 
 ```bash
 python chat.py \
   --checkpoint checkpoints/latest.pt \
-  --prompt "Напиши функцию бинарного поиска на Python" \
+  --prompt "Напиши бинарный поиск на C++" \
   --temperature 0.8 \
   --top_k 50 \
   --gate_threshold 0.9 \
@@ -169,28 +199,34 @@ python chat.py \
 
 ---
 
-## Что лежит в чекпоинте `latest.pt`
+## Что хранится в `latest.pt`
 
-- `model_state_dict`,
-- `optimizer_state_dict`,
-- `config` (включая `n_loops`),
-- `tokenizer`,
-- `step`,
-- `args` запуска.
-
----
-
-## Практические советы
-
-1. Для русского и кода обычно лучше `cl100k_base`.
-2. Если модель «слишком рано уверена», увеличьте `entropy_reg_weight`.
-3. Для более глубокого рассуждения увеличивайте `n_loops`, но следите за скоростью.
-4. Если VRAM не хватает, уменьшайте `batch_size`, `block_size` и `n_embd`.
-5. Для кода часто полезно: `temperature=0.6..0.9`, `top_k=30..80`.
+- `model_state_dict`
+- `optimizer_state_dict`
+- `config` (включая `n_loops`)
+- `tokenizer`
+- `step`
+- `args`
 
 ---
 
-## Частые ошибки
+## Рекомендации по качеству
+
+1. Для русского+кода чаще всего лучше `cl100k_base`.
+2. Данные важнее гиперпараметров: чистый и разнообразный корпус даёт основной прирост.
+3. Если модель рано «закрывает» reasoning, увеличьте `early_exit_penalty_weight`.
+4. Если `val_loss` не падает:
+   - уменьшите `learning_rate`,
+   - увеличьте размер корпуса,
+   - уменьшите модель для начала.
+5. Если не хватает VRAM:
+   - уменьшите `batch_size`,
+   - уменьшите `block_size`,
+   - уменьшите `n_embd`.
+
+---
+
+## Типичные ошибки
 
 ### `ModuleNotFoundError: No module named 'torch'`
 
@@ -198,7 +234,7 @@ python chat.py \
 pip install torch
 ```
 
-### `ImportError` для `tiktoken`
+### `ImportError: No module named tiktoken`
 
 ```bash
 pip install tiktoken
@@ -206,11 +242,11 @@ pip install tiktoken
 
 ### `CUDA запрошена, но недоступна`
 
-- Используйте `--device cpu`,
+- используйте `--device cpu`,
 - или установите CUDA-совместимую сборку PyTorch.
 
 ---
 
 ## Лицензия
 
-Используйте и модифицируйте под свои задачи.
+Используйте и модифицируйте проект под свои задачи.
